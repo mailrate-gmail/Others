@@ -1,0 +1,158 @@
+"""
+RabbitMQ队列迁移器
+该脚本用于将RabbitMQ队列从一个集群迁移到另一个集群时在新集群环境创建负载均衡。
+使用说明
+
+环境准备：
+安装依赖：pip install pika
+确保新集群的RabbitMQ已正确配置，且管理插件启用。
+确保旧集群的元数据文件（metadata.json）已下载并放置在脚本同级目录。
+
+配置脚本：
+修改 NEW_CLUSTER_HOSTS 为新集群的节点IP地址列表。
+设置 USERNAME 和 PASSWORD 为RabbitMQ的用户名和密码。
+确保 METADATA_FILE 指向正确的元数据文件路径。
+
+运行脚本：
+python rabbitmq_queue_migration.py
+
+日志输出：
+脚本会记录连接、队列创建和错误信息，方便排查问题。
+成功创建的队列会显示在日志中，格式为 Created queue <queue_name> on channel <channel>。
+
+注意事项：
+确保新集群的节点都能通过网络访问。
+如果队列数量较多，建议分批运行脚本以避免过载。
+检查元数据文件格式，确保包含 queues 字段，且每个队列有 name 和必要的参数（如 durable、arguments）。  
+"""`
+# -*- coding: utf-8 -*-`
+
+import json
+import random
+import pika
+from typing import List, Dict
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class RabbitMQQueueMigrator:
+    def __init__(self, hosts: List[str], username: str, password: str):
+        """
+        初始化RabbitMQ队列迁移器
+        :param hosts: 新集群的节点IP地址列表
+        :param username: RabbitMQ用户名
+        :param password: RabbitMQ密码
+        """
+        self.hosts = hosts
+        self.credentials = pika.PlainCredentials(username, password)
+        self.connection_pool = []
+        self.channel_pool = []
+        self._initialize_connections()
+
+    def _initialize_connections(self):
+        """
+        初始化每个节点的连接和通道
+        """
+        for host in self.hosts:
+            try:
+                connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(
+                        host=host,
+                        credentials=self.credentials,
+                        heartbeat=600
+                    )
+                )
+                channel = connection.channel()
+                self.connection_pool.append(connection)
+                self.channel_pool.append(channel)
+                logger.info(f"Successfully connected to {host}")
+            except Exception as e:
+                logger.error(f"Failed to connect to {host}: {e}")
+
+    def _get_random_channel(self):
+        """
+        从通道池中随机选择一个通道
+        :return: 随机通道
+        """
+        if not self.channel_pool:
+            raise Exception("No available channels in pool")
+        return random.choice(self.channel_pool)
+
+    def create_queue(self, queue_name: str, arguments: Dict = None):
+        """
+        在随机节点上创建队列
+        :param queue_name: 队列名称
+        :param arguments: 队列参数（如durable, auto_delete等）
+        """
+        channel = self._get_random_channel()
+        try:
+            channel.queue_declare(
+                queue=queue_name,
+                durable=arguments.get('durable', True),
+                exclusive=arguments.get('exclusive', False),
+                auto_delete=arguments.get('auto_delete', False),
+                arguments=arguments.get('arguments', {})
+            )
+            logger.info(f"Created queue {queue_name} on channel {channel}")
+        except Exception as e:
+            logger.error(f"Failed to create queue {queue_name}: {e}")
+
+    def close_connections(self):
+        """
+        关闭所有连接
+        """
+        for conn in self.connection_pool:
+            try:
+                conn.close()
+                logger.info("Closed connection")
+            except Exception as e:
+                logger.error(f"Error closing connection: {e}")
+
+def load_metadata(file_path: str) -> List[Dict]:
+    """
+    加载元数据文件
+    :param file_path: 元数据文件路径
+    :return: 队列信息列表
+    """
+    try:
+        with open(file_path, 'r') as f:
+            metadata = json.load(f)
+        queues = metadata.get('queues', [])
+        logger.info(f"Loaded {len(queues)} queues from {file_path}")
+        return queues
+    except Exception as e:
+        logger.error(f"Failed to load metadata: {e}")
+        return []
+
+def main():
+    # 配置新集群信息
+    NEW_CLUSTER_HOSTS = ['192.168.1.101', '192.168.1.102', '192.168.1.103']  # 替换为新集群的实际IP
+    USERNAME = 'admin'  # 替换为实际用户名
+    PASSWORD = 'password'  # 替换为实际密码
+    METADATA_FILE = 'metadata.json'  # 元数据文件路径
+
+    # 初始化迁移器
+    migrator = RabbitMQQueueMigrator(NEW_CLUSTER_HOSTS, USERNAME, PASSWORD)
+
+    # 加载元数据
+    queues = load_metadata(METADATA_FILE)
+
+    # 创建所有队列
+    for queue in queues:
+        queue_name = queue.get('name')
+        arguments = {
+            'durable': queue.get('durable', True),
+            'exclusive': queue.get('exclusive', False),
+            'auto_delete': queue.get('auto_delete', False),
+            'arguments': queue.get('arguments', {})
+        }
+        migrator.create_queue(queue_name, arguments)
+
+    # 关闭连接
+    migrator.close_connections()
+    logger.info("Queue migration completed")
+
+if __name__ == '__main__':
+    main()
